@@ -1,0 +1,9 @@
+spacy
+nltk
+scipy
+torch
+transformers
+tokenizers
+accelerate
+text-generation>=0.3.1
+gradio>=3.21.0
