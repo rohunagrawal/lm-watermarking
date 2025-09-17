@@ -24,11 +24,17 @@ arg_dict = {
     # 'model_name_or_path': 'facebook/opt-2.7b', # historical
     # 'model_name_or_path': 'facebook/opt-6.7b', # historical
     # 'model_name_or_path': 'meta-llama/Llama-2-7b-hf', # historical
-    'model_name_or_path': 'meta-llama/Llama-3.1-8B',
+    'model_name_or_path': 'meta-llama/Llama-3.2-3B',
     'all_models':[
-        "meta-llama/Llama-3.1-8B",
+        # "meta-llama/Llama-3.1-8B", # too big for the A10G 24GB
         "meta-llama/Llama-3.2-3B",
-        "meta-llama/Llama-3.2-1B",
+        # "meta-llama/Llama-3.2-1B",
+        # "Qwen/Qwen3-8B", # too big for the A10G 24GB
+        # "Qwen/Qwen3-4B",
+        # "Qwen/Qwen3-1.7B",
+        # "Qwen/Qwen3-0.6B",
+        # "Qwen/Qwen3-4B-Instruct-2507",
+        # "Qwen/Qwen3-4B-Thinking-2507",
     ],
     # 'load_fp16' : True,
     'load_fp16' : False,

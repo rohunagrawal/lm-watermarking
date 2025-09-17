@@ -19,6 +19,8 @@ import argparse
 from pprint import pprint
 from functools import partial
 
+import gc
+
 import numpy # for gradio hot reload
 import gradio as gr
 
@@ -201,14 +203,16 @@ def load_model(args):
     """Load and return the model and tokenizer"""
 
     args.is_seq2seq_model = any([(model_type in args.model_name_or_path.lower()) for model_type in ["t5","T0"]])
-    args.is_decoder_only_model = any([(model_type in args.model_name_or_path.lower()) for model_type in ["gpt","opt","bloom","llama"]])
+    args.is_decoder_only_model = any([(model_type in args.model_name_or_path.lower()) for model_type in ["gpt","opt","bloom","llama","qwen"]])
     if args.is_seq2seq_model:
         model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path)
     elif args.is_decoder_only_model:
         if args.load_fp16:
-            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.float16, device_map='auto')
+            # model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.float16, device_map='auto')
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.float16)
         elif args.load_bf16:
-            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.bfloat16, device_map='auto')
+            # model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.bfloat16, device_map='auto')
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.bfloat16)
         else:
             model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
     else:
@@ -216,12 +220,18 @@ def load_model(args):
 
     if args.use_gpu:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        if args.load_fp16 or args.load_bf16: 
-            pass
-        else: 
-            model = model.to(device)
+        # if args.load_fp16 or args.load_bf16: 
+        #     pass
+        # else: 
+        model = model.to(device)
     else:
         device = "cpu"
+
+    if args.load_bf16:
+        model = model.to(torch.bfloat16)
+    if args.load_fp16:
+        model = model.to(torch.float16)
+    
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -451,10 +461,6 @@ def detect(input_text, args, tokenizer, device=None, return_green_token_mask=Tru
 
 def run_gradio(args, model=None, device=None, tokenizer=None):
     """Define and launch the gradio demo interface"""
-    check_prompt_partial = partial(check_prompt, model=model, device=device)
-    generate_partial = partial(generate, model=model, device=device)
-    detect_partial = partial(detect, device=device)
-
 
     css = """
     .green { color: black!important;line-height:1.9em; padding: 0.2em 0.2em; background: #ccffcc; border-radius:0.5rem;}
@@ -490,7 +496,11 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         default_prompt = args.__dict__.pop("default_prompt")
         session_args = gr.State(value=args)
         # note that state obj automatically calls value if it's a callable, want to avoid calling tokenizer at startup
-        session_tokenizer = gr.State(value=lambda : tokenizer) 
+        session_tokenizer = gr.State(value=lambda : tokenizer)
+
+        check_prompt_partial = partial(check_prompt, model=model, device=device)
+        generate_partial = partial(generate, model=model, device=device)
+        detect_partial = partial(detect, device=device)
 
         with gr.Tab("Welcome"):
             with gr.Row():
@@ -714,7 +724,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
 
         # State management logic
         # define update callbacks that change the state dict
-        def update_model(session_state, value): session_state.model_name_or_path = value; return session_state
+        def update_model_state(session_state, value): session_state.model_name_or_path = value; return session_state
         def update_sampling_temp(session_state, value): session_state.sampling_temp = float(value); return session_state
         def update_generation_seed(session_state, value): session_state.generation_seed = int(value); return session_state
         def update_gamma(session_state, value): session_state.gamma = float(value); return session_state
@@ -777,6 +787,13 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
             # else:
             return AutoTokenizer.from_pretrained(model_name_or_path)
         
+        def update_model(state, old_model): 
+            del old_model 
+            torch.cuda.empty_cache()
+            gc.collect()
+            model, _, _ = load_model(state)
+            return model
+        
         def check_model(value): return value if (value!="" and value is not None) else args.model_name_or_path
         # enforce constraint that model cannot be null or empty
         # then attach model callbacks in particular
@@ -793,9 +810,9 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         ).then(
             toggle_delta_for_api_model,inputs=[model_selector,delta], outputs=[delta]
         ).then(
-            update_tokenizer,inputs=[model_selector], outputs=[session_tokenizer]
+            update_model_state,inputs=[session_args, model_selector], outputs=[session_args]
         ).then(
-            update_model,inputs=[session_args, model_selector], outputs=[session_args]
+            update_tokenizer,inputs=[model_selector], outputs=[session_tokenizer]
         ).then(
             lambda value: str(value), inputs=[session_args], outputs=[current_parameters]
         )
@@ -843,7 +860,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         select_green_tokens.change(fn=detect_partial, inputs=[output_with_watermark,session_args,session_tokenizer], outputs=[with_watermark_detection_result,session_args,session_tokenizer,html_with_watermark])
         select_green_tokens.change(fn=detect_partial, inputs=[detection_input,session_args,session_tokenizer], outputs=[detection_result,session_args,session_tokenizer,html_detection_input])
 
-    # demo.queue(concurrency_count=3)
+
     demo.queue()
 
     if args.demo_public:
