@@ -9,6 +9,13 @@ from typing import Dict, Iterator, Optional
 import torch
 
 try:
+    import wandb
+except ImportError as exc:  # pragma: no cover - dependency availability
+    raise ImportError(
+        "train_grpo requires the 'wandb' package. Install it with 'pip install wandb'."
+    ) from exc
+
+try:
     from datasets import load_dataset
 except ImportError as exc:  # pragma: no cover - dependency availability
     raise ImportError(
@@ -59,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=512,
         help="Maximum number of tokens generated for each answer.",
     )
     parser.add_argument(
@@ -84,6 +91,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed controlling sampling operations.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default="grpo-training",
+        help="Weights & Biases project name for logging.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        default=None,
+        help="Weights & Biases run name. If None, auto-generated.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=None,
+        help="Weights & Biases entity (username or team name).",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable Weights & Biases logging.",
     )
     return parser.parse_args()
 
@@ -177,6 +204,27 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    # Initialize wandb
+    if not args.no_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            config={
+                "model_name": args.model_name,
+                "dataset_name": args.dataset_name,
+                "dataset_config": args.dataset_config,
+                "split": args.split,
+                "max_samples": args.max_samples,
+                "batch_size": args.batch_size,
+                "max_new_tokens": args.max_new_tokens,
+                "learning_rate": args.learning_rate,
+                "max_steps": args.max_steps,
+                "device": args.device,
+                "seed": args.seed,
+            }
+        )
+
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token_id is None:
@@ -209,6 +257,7 @@ def main() -> None:
         reference_model=reference_model,
         config=GRPOConfig(),
         device=device,
+        use_wandb=not args.no_wandb,
     )
 
     steps = math.ceil(len(dataset) / args.batch_size)
@@ -230,6 +279,8 @@ def main() -> None:
         print(f"step={step} | reward_mean={stats['reward_mean']:.3f} | kl={stats['kl_mean']:.3f}")
 
     print("Training finished")
+    if not args.no_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

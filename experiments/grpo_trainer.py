@@ -92,6 +92,7 @@ class GRPOTrainer:
         value_head: Optional[nn.Module] = None,
         config: Optional[GRPOConfig] = None,
         device: Optional[torch.device] = None,
+        use_wandb: bool = False,
     ) -> None:
         self.policy_model = policy_model
         self.reference_model = reference_model
@@ -100,6 +101,8 @@ class GRPOTrainer:
         self.optimizer = optimizer
         self.config = config or GRPOConfig()
         self.device = device or next(policy_model.parameters()).device
+        self.use_wandb = use_wandb
+        self.step_count = 0
 
         if self.reference_model is not None:
             self.reference_model.to(self.device)
@@ -161,7 +164,13 @@ class GRPOTrainer:
         stats = {
             "policy_loss": policy_loss.item(),
             "reward_mean": rewards.mean().item(),
+            "reward_std": rewards.std().item(),
+            "reward_min": rewards.min().item(),
+            "reward_max": rewards.max().item(),
             "kl_mean": kl.mean().item(),
+            "kl_std": kl.std().item(),
+            "advantages_mean": advantages.mean().item(),
+            "advantages_std": advantages.std().item(),
         }
 
         loss = policy_loss
@@ -181,6 +190,21 @@ class GRPOTrainer:
 
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # Compute gradient norm before clipping
+        total_norm = 0.0
+        for p in self.policy_model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        if self.value_head is not None:
+            for p in self.value_head.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
+        stats["grad_norm"] = total_norm
+        
         if self.config.max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 list(self.policy_model.parameters())
@@ -189,6 +213,16 @@ class GRPOTrainer:
             )
         self.optimizer.step()
 
+        # Log to wandb if enabled
+        if self.use_wandb:
+            try:
+                import wandb
+                stats_with_step = {"step": self.step_count, **stats}
+                wandb.log(stats_with_step)
+            except ImportError:
+                pass  # wandb not available, skip logging
+
+        self.step_count += 1
         return stats
 
     def _gather_log_probs(
