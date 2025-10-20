@@ -226,15 +226,15 @@ def main() -> None:
         )
 
     device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
         else:
             tokenizer.pad_token = tokenizer.special_tokens_map.get("bos_token", 0)
 
-    policy_model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
-    reference_model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    policy_model = AutoModelForCausalLM.from_pretrained(args.model_name, trust_remote_code=True).to(device)
+    reference_model = AutoModelForCausalLM.from_pretrained(args.model_name, trust_remote_code=True).to(device)
     reference_model.eval()
     policy_model.config.pad_token_id = tokenizer.pad_token_id
     reference_model.config.pad_token_id = tokenizer.pad_token_id
