@@ -96,6 +96,19 @@ def build_prompt(question: str, system_prompt: str) -> str:
     return messages
 
 
+def _repeat_batch(encoded: Dict[str, torch.Tensor], batch_size: int) -> Dict[str, torch.Tensor]:
+    """Repeat tokenized inputs along the batch dimension."""
+
+    if batch_size == 1:
+        return encoded
+
+    repeated: Dict[str, torch.Tensor] = {}
+    for key, value in encoded.items():
+        repeats = (batch_size,) + (1,) * (value.dim() - 1)
+        repeated[key] = value.repeat(repeats)
+    return repeated
+
+
 def generate_completions(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -107,45 +120,57 @@ def generate_completions(
     top_p: float,
     device: torch.device,
     seed: int,
+    batch_size: int,
 ) -> List[str]:
     """Generate ``num_samples`` completions for a single question."""
 
-    completions: List[str] = []
+    messages = build_prompt(question, system_prompt)
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    encoded = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
 
-    for sample_idx in range(num_samples):
-        print(f"Generating completion {sample_idx + 1} of {num_samples} (normal generation)")
+    completions: List[str] = []
+    total_batches = math.ceil(num_samples / batch_size)
+
+    for batch_idx in range(total_batches):
+        current_batch_size = min(batch_size, num_samples - len(completions))
+        print(
+            "Generating batch"
+            f" {batch_idx + 1} of {total_batches} (normal generation, batch size {current_batch_size})"
+        )
         start_time = time.time()
-        
-        generator = torch.Generator(device=device).manual_seed(seed + sample_idx)
-        messages = build_prompt(question, system_prompt)
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        encoded = tokenizer(
-            prompt_text,
-            return_tensors="pt",
-        )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
+
+        generator = torch.Generator(device=device).manual_seed(seed + len(completions))
+        batch_inputs = _repeat_batch(encoded, current_batch_size)
 
         output = model.generate(
-            **encoded,
+            **batch_inputs,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            generator=generator,
         )
 
-        generated_ids = output[0, encoded["input_ids"].shape[1]:]
-        completion = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        completions.append(completion)
-        
+        generated_ids = output[:, encoded["input_ids"].shape[1]:]
+        batch_completions = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        completions.extend(completion.strip() for completion in batch_completions)
+
         end_time = time.time()
         generation_time = end_time - start_time
-        print(f"Normal generation {sample_idx + 1} completed in {generation_time:.2f} seconds")
+        print(
+            "Normal generation batch"
+            f" {batch_idx + 1} completed in {generation_time:.2f} seconds"
+        )
 
     return completions
 
@@ -166,17 +191,36 @@ def generate_completions_with_watermark(
     watermark_seeding_scheme: str,
     watermark_select_green: bool,
     watermark_seed: int,
+    batch_size: int,
 ) -> List[str]:
     """Generate ``num_samples`` completions that apply the repository watermark."""
 
-    completions: List[str] = []
     vocab_ids = list(tokenizer.get_vocab().values())
 
-    for sample_idx in range(num_samples):
-        print(f"Generating completion {sample_idx + 1} of {num_samples} (watermark generation)")
+    messages = build_prompt(question, system_prompt)
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    encoded = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    completions: List[str] = []
+    total_batches = math.ceil(num_samples / batch_size)
+
+    for batch_idx in range(total_batches):
+        current_batch_size = min(batch_size, num_samples - len(completions))
+        print(
+            "Generating batch"
+            f" {batch_idx + 1} of {total_batches} (watermark generation, batch size {current_batch_size})"
+        )
         start_time = time.time()
-        
-        generator = torch.Generator(device=device).manual_seed(seed + sample_idx)
+
+        generator = torch.Generator(device=device).manual_seed(seed + len(completions))
         watermark_processor = WatermarkLogitsProcessor(
             vocab=vocab_ids,
             gamma=watermark_gamma,
@@ -185,23 +229,13 @@ def generate_completions_with_watermark(
             select_green_tokens=watermark_select_green,
         )
         watermark_processor.rng = torch.Generator(device=device)
-        watermark_processor.rng.manual_seed(watermark_seed + sample_idx)
-
-        messages = build_prompt(question, system_prompt)
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        encoded = tokenizer(
-            prompt_text,
-            return_tensors="pt",
-        )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
+        watermark_processor.rng.manual_seed(watermark_seed + len(completions))
 
         logits_processor = LogitsProcessorList([watermark_processor])
+        batch_inputs = _repeat_batch(encoded, current_batch_size)
+
         output = model.generate(
-            **encoded,
+            **batch_inputs,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
@@ -209,15 +243,19 @@ def generate_completions_with_watermark(
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             logits_processor=logits_processor,
+            generator=generator,
         )
 
-        generated_ids = output[0, encoded["input_ids"].shape[1]:]
-        completion = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        completions.append(completion)
-        
+        generated_ids = output[:, encoded["input_ids"].shape[1]:]
+        batch_completions = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        completions.extend(completion.strip() for completion in batch_completions)
+
         end_time = time.time()
         generation_time = end_time - start_time
-        print(f"Watermark generation {sample_idx + 1} completed in {generation_time:.2f} seconds")
+        print(
+            "Watermark generation batch"
+            f" {batch_idx + 1} completed in {generation_time:.2f} seconds"
+        )
 
     return completions
 
@@ -226,6 +264,11 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     dataset = load_dataset("gsm8k", "main", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
+
+    if args.generation_batch_size is None:
+        args.generation_batch_size = args.num_samples
+    if args.generation_batch_size <= 0:
+        raise ValueError("generation_batch_size must be a positive integer")
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
@@ -259,6 +302,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 top_p=args.top_p,
                 device=device,
                 seed=args.seed + idx * args.num_samples,
+                batch_size=args.generation_batch_size,
             )
         else:
             completions = generate_completions_with_watermark(
@@ -277,6 +321,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 watermark_seeding_scheme=args.watermark_seeding_scheme,
                 watermark_select_green=args.watermark_select_green,
                 watermark_seed=args.watermark_seed + idx * args.num_samples,
+                batch_size=args.generation_batch_size,
             )
 
         per_sample = SampleResult(
@@ -396,6 +441,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed for generation.",
+    )
+    parser.add_argument(
+        "--generation-batch-size",
+        type=int,
+        default=None,
+        help="Number of completions to generate simultaneously.",
     )
     parser.add_argument(
         "--system-prompt",
