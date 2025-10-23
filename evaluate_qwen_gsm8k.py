@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -112,6 +113,9 @@ def generate_completions(
     completions: List[str] = []
 
     for sample_idx in range(num_samples):
+        print(f"Generating completion {sample_idx + 1} of {num_samples} (normal generation)")
+        start_time = time.time()
+        
         generator = torch.Generator(device=device).manual_seed(seed + sample_idx)
         messages = build_prompt(question, system_prompt)
         prompt_text = tokenizer.apply_chat_template(
@@ -133,12 +137,15 @@ def generate_completions(
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            generator=generator,
         )
 
         generated_ids = output[0, encoded["input_ids"].shape[1]:]
         completion = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         completions.append(completion)
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        print(f"Normal generation {sample_idx + 1} completed in {generation_time:.2f} seconds")
 
     return completions
 
@@ -166,6 +173,9 @@ def generate_completions_with_watermark(
     vocab_ids = list(tokenizer.get_vocab().values())
 
     for sample_idx in range(num_samples):
+        print(f"Generating completion {sample_idx + 1} of {num_samples} (watermark generation)")
+        start_time = time.time()
+        
         generator = torch.Generator(device=device).manual_seed(seed + sample_idx)
         watermark_processor = WatermarkLogitsProcessor(
             vocab=vocab_ids,
@@ -198,13 +208,16 @@ def generate_completions_with_watermark(
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            generator=generator,
             logits_processor=logits_processor,
         )
 
         generated_ids = output[0, encoded["input_ids"].shape[1]:]
         completion = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         completions.append(completion)
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        print(f"Watermark generation {sample_idx + 1} completed in {generation_time:.2f} seconds")
 
     return completions
 
@@ -298,10 +311,12 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
             for k in sorted(args.pass_k):
                 print(f"  pass@{k}: {per_sample.pass_at_k[k]:.3f}")
 
-    averaged_scores = {
-        f"pass@{k}": float(sum(scores) / len(scores)) if scores else 0.0
-        for k, scores in aggregate_pass_at_k.items()
-    }
+        averaged_scores = {
+            f"pass@{k}": float(sum(scores) / len(scores)) if scores else 0.0
+            for k, scores in aggregate_pass_at_k.items()
+        }
+
+        print(averaged_scores)
 
     if args.output_path:
         with open(args.output_path, "w", encoding="utf-8") as fh:
