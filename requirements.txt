@@ -1,6 +1,8 @@
+datasets
 gradio
 nltk
 scipy
 torch
 transformers
 tokenizers
+wandb
