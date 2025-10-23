@@ -10,7 +10,9 @@ from typing import Dict, List, Optional
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
+
+from extended_watermark_processor import WatermarkLogitsProcessor
 
 
 @dataclass
@@ -141,6 +143,72 @@ def generate_completions(
     return completions
 
 
+def generate_completions_with_watermark(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    question: str,
+    system_prompt: str,
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+    seed: int,
+    watermark_gamma: float,
+    watermark_delta: float,
+    watermark_seeding_scheme: str,
+    watermark_select_green: bool,
+    watermark_seed: int,
+) -> List[str]:
+    """Generate ``num_samples`` completions that apply the repository watermark."""
+
+    completions: List[str] = []
+    vocab_ids = list(tokenizer.get_vocab().values())
+
+    for sample_idx in range(num_samples):
+        generator = torch.Generator(device=device).manual_seed(seed + sample_idx)
+        watermark_processor = WatermarkLogitsProcessor(
+            vocab=vocab_ids,
+            gamma=watermark_gamma,
+            delta=watermark_delta,
+            seeding_scheme=watermark_seeding_scheme,
+            select_green_tokens=watermark_select_green,
+        )
+        watermark_processor.rng = torch.Generator(device=device)
+        watermark_processor.rng.manual_seed(watermark_seed + sample_idx)
+
+        messages = build_prompt(question, system_prompt)
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        encoded = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+        )
+        encoded = {k: v.to(device) for k, v in encoded.items()}
+
+        logits_processor = LogitsProcessorList([watermark_processor])
+        output = model.generate(
+            **encoded,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            generator=generator,
+            logits_processor=logits_processor,
+        )
+
+        generated_ids = output[0, encoded["input_ids"].shape[1]:]
+        completion = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        completions.append(completion)
+
+    return completions
+
+
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     dataset = load_dataset("gsm8k", "main", split=args.split)
     if args.limit is not None:
@@ -166,18 +234,37 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
 
     for idx, example in enumerate(dataset):
         reference_answer = parse_gsm8k_answer(example["answer"])
-        completions = generate_completions(
-            model=model,
-            tokenizer=tokenizer,
-            question=example["question"],
-            system_prompt=args.system_prompt,
-            num_samples=args.num_samples,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            device=device,
-            seed=args.seed + idx * args.num_samples,
-        )
+        if args.disable_watermark:
+            completions = generate_completions(
+                model=model,
+                tokenizer=tokenizer,
+                question=example["question"],
+                system_prompt=args.system_prompt,
+                num_samples=args.num_samples,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                device=device,
+                seed=args.seed + idx * args.num_samples,
+            )
+        else:
+            completions = generate_completions_with_watermark(
+                model=model,
+                tokenizer=tokenizer,
+                question=example["question"],
+                system_prompt=args.system_prompt,
+                num_samples=args.num_samples,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                device=device,
+                seed=args.seed + idx * args.num_samples,
+                watermark_gamma=args.watermark_gamma,
+                watermark_delta=args.watermark_delta,
+                watermark_seeding_scheme=args.watermark_seeding_scheme,
+                watermark_select_green=args.watermark_select_green,
+                watermark_seed=args.watermark_seed + idx * args.num_samples,
+            )
 
         per_sample = SampleResult(
             question=example["question"],
@@ -195,6 +282,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                     "completion": completion,
                     "predicted_answer": predicted_answer,
                     "is_correct": correct,
+                    "watermark_applied": not args.disable_watermark,
                 }
             )
 
@@ -319,6 +407,47 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print per-problem metrics during evaluation.",
     )
+    parser.add_argument(
+        "--disable-watermark",
+        action="store_true",
+        help="Skip applying the watermark during generation.",
+    )
+    parser.add_argument(
+        "--watermark-gamma",
+        type=float,
+        default=0.25,
+        help="Fraction of the vocabulary used for the watermark greenlist.",
+    )
+    parser.add_argument(
+        "--watermark-delta",
+        type=float,
+        default=2.0,
+        help="Logit bias added to watermark greenlist tokens.",
+    )
+    parser.add_argument(
+        "--watermark-seeding-scheme",
+        default="selfhash",
+        help="Seeding scheme used by the watermark processor.",
+    )
+    parser.add_argument(
+        "--watermark-seed",
+        type=int,
+        default=0,
+        help="Base seed for the watermark RNG.",
+    )
+    parser.add_argument(
+        "--watermark-select-green",
+        dest="watermark_select_green",
+        action="store_true",
+        help="Select watermark tokens from the greenlist directly (default).",
+    )
+    parser.add_argument(
+        "--watermark-select-red",
+        dest="watermark_select_green",
+        action="store_false",
+        help="Select watermark tokens via the complement redlist (legacy behavior).",
+    )
+    parser.set_defaults(watermark_select_green=True)
     return parser.parse_args()
 
 
