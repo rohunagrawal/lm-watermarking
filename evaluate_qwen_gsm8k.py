@@ -274,7 +274,10 @@ def generate_completions_with_watermark(
 
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
-    run_name = f"qwen-gsm8k-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+    if not args.disable_watermark:
+        run_name = f"qwen-gsm8k-{args.model_name}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+    else:
+        run_name = f"qwen-gsm8k-{args.model_name}"
     wandb.init(project="qwen-gsm8k-eval", config=vars(args), name=run_name)
     run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
@@ -348,8 +351,11 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         )
 
         num_correct = 0
+        unique_predicted_answers = set()
         for completion in completions:
             predicted_answer = parse_model_answer(completion)
+            if predicted_answer is not None:
+                unique_predicted_answers.add(predicted_answer)
             correct = is_answer_correct(predicted_answer, reference_answer)
             if correct:
                 num_correct += 1
@@ -372,6 +378,8 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 not args.disable_watermark
             )
             wandb.log({"generations": run_table})
+        num_unique_predicted_answers = len(unique_predicted_answers)
+        wandb.log({"num_unique_predicted_answers": num_unique_predicted_answers, "problem_idx": idx})
 
         for k in args.pass_k:
             score = compute_pass_at_k(args.num_samples, num_correct, k)
@@ -455,7 +463,7 @@ def parse_args() -> argparse.Namespace:
         "--pass-k",
         type=int,
         nargs="+",
-        default=[1, 2, 3],
+        default=[1, 2, 4],
         help="Values of k for pass@k computation.",
     )
     parser.add_argument(
