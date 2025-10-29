@@ -28,6 +28,7 @@ from transformers import LogitsProcessor
 from normalizers import normalization_strategy_lookup
 from alternative_prf_schemes import prf_lookup, seeding_scheme_lookup
 
+import time
 
 class WatermarkBase:
     def __init__(
@@ -68,9 +69,16 @@ class WatermarkBase:
         # enable for long, interesting streams of pseudorandom numbers: print(prf_key)
         self.rng.manual_seed(prf_key % (2**64 - 1))  # safeguard against overflow from long
 
+    def _seed_rng_random(self) -> None:
+        import random
+        random.seed(42)
+        random_seed = random.randint(1, 10000)
+        self.rng.manual_seed(random_seed)
+
     def _get_greenlist_ids(self, input_ids: torch.LongTensor) -> torch.LongTensor:
         """Seed rng based on local context width and use this information to generate ids on the green list."""
-        self._seed_rng(input_ids)
+        # self._seed_rng(input_ids)
+        self._seed_rng_random()
 
         greenlist_size = int(self.vocab_size * self.gamma)
         vocab_permutation = torch.randperm(self.vocab_size, device=input_ids.device, generator=self.rng)
@@ -137,6 +145,7 @@ class WatermarkLogitsProcessor(WatermarkBase, LogitsProcessor):
     def _bias_greenlist_logits(self, scores: torch.Tensor, greenlist_mask: torch.Tensor, greenlist_bias: float) -> torch.Tensor:
         scores[greenlist_mask] = scores[greenlist_mask] + greenlist_bias
         return scores
+         
 
     def _score_rejection_sampling(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, tail_rule="fixed_compute") -> list[int]:
         """Generate greenlist based on current candidate next token. Reject and move on if necessary. Method not batched.
@@ -172,17 +181,22 @@ class WatermarkLogitsProcessor(WatermarkBase, LogitsProcessor):
 
         # this is lazy to allow us to co-locate on the watermarked model's device
         self.rng = torch.Generator(device=input_ids.device) if self.rng is None else self.rng
-
+        
         # NOTE, it would be nice to get rid of this batch loop, but currently,
         # the seed and partition operations are not tensor/vectorized, thus
         # each sequence in the batch needs to be treated separately.
 
         list_of_greenlist_ids = [None for _ in input_ids]  # Greenlists could differ in length
         for b_idx, input_seq in enumerate(input_ids):
+            start_time = time.time()
             if self.self_salt:
                 greenlist_ids = self._score_rejection_sampling(input_seq, scores[b_idx])
+                end_time = time.time()
+                # print(f"Time taken to generate greenlist: {end_time - start_time} seconds")
             else:
                 greenlist_ids = self._get_greenlist_ids(input_seq)
+                end_time = time.time()
+                # print(f"Time taken to generate greenlist: {end_time - start_time} seconds")
             list_of_greenlist_ids[b_idx] = greenlist_ids
 
             # logic for computing and storing spike entropies for analysis

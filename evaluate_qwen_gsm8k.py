@@ -14,6 +14,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
 from extended_watermark_processor import WatermarkLogitsProcessor
+import wandb
 
 
 @dataclass
@@ -121,6 +122,7 @@ def generate_completions(
     device: torch.device,
     seed: int,
     batch_size: int,
+    answer: str
 ) -> List[str]:
     """Generate ``num_samples`` completions for a single question."""
 
@@ -147,7 +149,6 @@ def generate_completions(
         )
         start_time = time.time()
 
-        generator = torch.Generator(device=device).manual_seed(seed + len(completions))
         batch_inputs = _repeat_batch(encoded, current_batch_size)
 
         output = model.generate(
@@ -158,7 +159,6 @@ def generate_completions(
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            generator=generator,
         )
 
         generated_ids = output[:, encoded["input_ids"].shape[1]:]
@@ -167,6 +167,13 @@ def generate_completions(
 
         end_time = time.time()
         generation_time = end_time - start_time
+        if batch_completions:
+            print("Question:")
+            print(question)
+            print("Ground-Truth Answer:")
+            print(answer)
+            print("Example completion from this batch:")
+            print(batch_completions[0])
         print(
             "Normal generation batch"
             f" {batch_idx + 1} completed in {generation_time:.2f} seconds"
@@ -189,9 +196,9 @@ def generate_completions_with_watermark(
     watermark_gamma: float,
     watermark_delta: float,
     watermark_seeding_scheme: str,
-    watermark_select_green: bool,
     watermark_seed: int,
     batch_size: int,
+    answer: str
 ) -> List[str]:
     """Generate ``num_samples`` completions that apply the repository watermark."""
 
@@ -220,20 +227,18 @@ def generate_completions_with_watermark(
         )
         start_time = time.time()
 
-        generator = torch.Generator(device=device).manual_seed(seed + len(completions))
         watermark_processor = WatermarkLogitsProcessor(
             vocab=vocab_ids,
             gamma=watermark_gamma,
             delta=watermark_delta,
             seeding_scheme=watermark_seeding_scheme,
-            select_green_tokens=watermark_select_green,
         )
         watermark_processor.rng = torch.Generator(device=device)
         watermark_processor.rng.manual_seed(watermark_seed + len(completions))
 
         logits_processor = LogitsProcessorList([watermark_processor])
         batch_inputs = _repeat_batch(encoded, current_batch_size)
-
+    
         output = model.generate(
             **batch_inputs,
             do_sample=True,
@@ -243,7 +248,6 @@ def generate_completions_with_watermark(
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             logits_processor=logits_processor,
-            generator=generator,
         )
 
         generated_ids = output[:, encoded["input_ids"].shape[1]:]
@@ -252,6 +256,14 @@ def generate_completions_with_watermark(
 
         end_time = time.time()
         generation_time = end_time - start_time
+        # INSERT_YOUR_CODE
+        if batch_completions:
+            print("Question:")
+            print(question)
+            print("Ground-Truth Answer:")
+            print(answer)
+            print("Example completion from this batch:")
+            print(batch_completions[0])
         print(
             "Watermark generation batch"
             f" {batch_idx + 1} completed in {generation_time:.2f} seconds"
@@ -261,6 +273,11 @@ def generate_completions_with_watermark(
 
 
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
+    # WANDB SETUP
+    run_name = f"qwen-gsm8k-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+    wandb.init(project="qwen-gsm8k-eval", config=vars(args), name=run_name)
+    run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
+
     dataset = load_dataset("gsm8k", "main", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
@@ -303,6 +320,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 device=device,
                 seed=args.seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
+                answer=reference_answer,
             )
         else:
             completions = generate_completions_with_watermark(
@@ -319,9 +337,9 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 watermark_gamma=args.watermark_gamma,
                 watermark_delta=args.watermark_delta,
                 watermark_seeding_scheme=args.watermark_seeding_scheme,
-                watermark_select_green=args.watermark_select_green,
                 watermark_seed=args.watermark_seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
+                answer=reference_answer
             )
 
         per_sample = SampleResult(
@@ -343,11 +361,24 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                     "watermark_applied": not args.disable_watermark,
                 }
             )
+            # WANDB: log generation to table
+            run_table.add_data(
+                idx,
+                example["question"],
+                reference_answer,
+                completion,
+                predicted_answer,
+                correct,
+                not args.disable_watermark
+            )
+            wandb.log({"generations": run_table})
 
         for k in args.pass_k:
             score = compute_pass_at_k(args.num_samples, num_correct, k)
             per_sample.pass_at_k[k] = score
             aggregate_pass_at_k[k].append(score)
+            # WANDB: log per-problem pass@k metric
+            wandb.log({f"pass@{k}_problem": score, "problem_idx": idx})
 
         sample_results.append(per_sample)
 
@@ -384,6 +415,15 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 ensure_ascii=False,
             )
 
+    # WANDB: log averages and generations table
+    averaged_scores = {
+        f"pass@{k}": float(sum(scores) / len(scores)) if scores else 0.0
+        for k, scores in aggregate_pass_at_k.items()
+    }
+    wandb.log({**averaged_scores, "final_step": True})
+    wandb.log({"generations": run_table})
+    wandb.finish()
+
     return averaged_scores
 
 
@@ -391,7 +431,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-name",
-        default="Qwen/Qwen1.5-0.5B-Chat",
+        default="Qwen/Qwen2.5-3B-Instruct",
         help="Name of the Hugging Face model to evaluate.",
     )
     parser.add_argument(
@@ -487,12 +527,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--watermark-delta",
         type=float,
-        default=2.0,
+        default=0.5,
         help="Logit bias added to watermark greenlist tokens.",
     )
     parser.add_argument(
         "--watermark-seeding-scheme",
-        default="selfhash",
+        default="lefthash",
         help="Seeding scheme used by the watermark processor.",
     )
     parser.add_argument(
@@ -501,19 +541,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Base seed for the watermark RNG.",
     )
-    parser.add_argument(
-        "--watermark-select-green",
-        dest="watermark_select_green",
-        action="store_true",
-        help="Select watermark tokens from the greenlist directly (default).",
-    )
-    parser.add_argument(
-        "--watermark-select-red",
-        dest="watermark_select_green",
-        action="store_false",
-        help="Select watermark tokens via the complement redlist (legacy behavior).",
-    )
-    parser.set_defaults(watermark_select_green=True)
     return parser.parse_args()
 
 
