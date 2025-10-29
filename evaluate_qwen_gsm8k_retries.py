@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from datasets import load_dataset
@@ -23,8 +23,19 @@ class SampleResult:
 
     question: str
     reference_answer: str
-    generations: List[Dict[str, Optional[str]]] = field(default_factory=list)
+    generations: List[Dict[str, Any]] = field(default_factory=list)
     pass_at_k: Dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class ConversationState:
+    """Tracks the state of a single conversation across retry attempts."""
+
+    messages: List[Dict[str, str]]
+    base_seed: int
+    watermark_seed: int
+    attempt_count: int = 0
+    success: bool = False
 
 
 ANSWER_PATTERN = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
@@ -155,80 +166,6 @@ def _generate_attempt(
     return completion.strip()
 
 
-def generate_with_retries(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    question: str,
-    system_prompt: str,
-    reference_answer: Optional[str],
-    device: torch.device,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    base_seed: int,
-    max_attempts: int,
-    retry_prompt: str,
-    watermark_params: Optional[Tuple[float, float, str, int]],
-    vocab_ids: Optional[List[int]],
-) -> Tuple[List[Dict[str, Optional[str]]], bool]:
-    """Run a conversation with retries until success or attempts are exhausted."""
-
-    messages = build_prompt(question, system_prompt)
-    attempts: List[Dict[str, Optional[str]]] = []
-    success = False
-
-    for attempt_idx in range(max_attempts):
-        start_time = time.time()
-        watermark_config = None
-        if watermark_params is not None:
-            gamma, delta, seeding_scheme, base_watermark_seed = watermark_params
-            watermark_config = (
-                gamma,
-                delta,
-                seeding_scheme,
-                base_watermark_seed + attempt_idx,
-            )
-
-        completion = _generate_attempt(
-            model=model,
-            tokenizer=tokenizer,
-            messages=messages,
-            device=device,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            generator_seed=base_seed + attempt_idx,
-            watermark_config=watermark_config,
-            vocab_ids=vocab_ids,
-        )
-        elapsed = time.time() - start_time
-
-        predicted_answer = parse_model_answer(completion)
-        correct = is_answer_correct(predicted_answer, reference_answer)
-
-        attempts.append(
-            {
-                "attempt": attempt_idx + 1,
-                "completion": completion,
-                "predicted_answer": predicted_answer,
-                "is_correct": correct,
-                "watermark_applied": watermark_params is not None,
-                "generation_time": elapsed,
-            }
-        )
-
-        messages.append({"role": "assistant", "content": completion})
-
-        if correct:
-            success = True
-            break
-
-        if attempt_idx < max_attempts - 1:
-            messages.append({"role": "user", "content": retry_prompt})
-
-    return attempts, success
-
-
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
     if not args.disable_watermark:
@@ -291,63 +228,97 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         )
 
         num_correct = 0
-        unique_predicted_answers = set()
+        unique_predicted_answers: Set[str] = set()
 
+        conversations: List[ConversationState] = []
         for sample_idx in range(args.num_samples):
-            base_seed = args.seed + idx * args.num_samples + sample_idx * args.max_attempts
+            base_seed = args.seed + (idx * args.num_samples + sample_idx) * args.max_attempts
             watermark_seed = (
-                args.watermark_seed + idx * args.num_samples + sample_idx * args.max_attempts
+                args.watermark_seed + (idx * args.num_samples + sample_idx) * args.max_attempts
             )
-            watermark_params = None
-            if not args.disable_watermark:
-                watermark_params = (
-                    args.watermark_gamma,
-                    args.watermark_delta,
-                    args.watermark_seeding_scheme,
-                    watermark_seed,
+            conversations.append(
+                ConversationState(
+                    messages=build_prompt(example["question"], args.system_prompt),
+                    base_seed=base_seed,
+                    watermark_seed=watermark_seed,
                 )
-
-            attempts, success = generate_with_retries(
-                model=model,
-                tokenizer=tokenizer,
-                question=example["question"],
-                system_prompt=args.system_prompt,
-                reference_answer=reference_answer,
-                device=device,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                base_seed=base_seed,
-                max_attempts=args.max_attempts,
-                retry_prompt=args.retry_prompt,
-                watermark_params=watermark_params,
-                vocab_ids=vocab_ids,
             )
 
-            for attempt in attempts:
-                if attempt["predicted_answer"] is not None:
-                    unique_predicted_answers.add(attempt["predicted_answer"])
-                record = {
-                    "sample_index": sample_idx,
-                    **attempt,
+        for attempt_idx in range(args.max_attempts):
+            pending_indices = [i for i, conv in enumerate(conversations) if not conv.success]
+            if not pending_indices:
+                break
+
+            for sample_idx in pending_indices:
+                conversation = conversations[sample_idx]
+
+                watermark_params = None
+                if not args.disable_watermark:
+                    watermark_params = (
+                        args.watermark_gamma,
+                        args.watermark_delta,
+                        args.watermark_seeding_scheme,
+                        conversation.watermark_seed + attempt_idx,
+                    )
+
+                start_time = time.time()
+                completion = _generate_attempt(
+                    model=model,
+                    tokenizer=tokenizer,
+                    messages=conversation.messages,
+                    device=device,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    generator_seed=conversation.base_seed + attempt_idx,
+                    watermark_config=watermark_params,
+                    vocab_ids=vocab_ids,
+                )
+                elapsed = time.time() - start_time
+
+                predicted_answer = parse_model_answer(completion)
+                correct = is_answer_correct(predicted_answer, reference_answer)
+                attempt_number = conversation.attempt_count + 1
+
+                attempt_record = {
+                    "attempt": attempt_number,
+                    "completion": completion,
+                    "predicted_answer": predicted_answer,
+                    "is_correct": correct,
+                    "watermark_applied": watermark_params is not None,
+                    "generation_time": elapsed,
                 }
-                per_sample.generations.append(record)
+
+                conversation.attempt_count = attempt_number
+                record_with_sample = {"sample_index": sample_idx, **attempt_record}
+                per_sample.generations.append(record_with_sample)
+
                 run_table.add_data(
                     idx,
                     sample_idx,
-                    attempt["attempt"],
+                    attempt_number,
                     example["question"],
                     reference_answer,
-                    attempt["completion"],
-                    attempt["predicted_answer"],
-                    attempt["is_correct"],
-                    attempt["watermark_applied"],
+                    completion,
+                    predicted_answer,
+                    correct,
+                    watermark_params is not None,
                 )
                 wandb.log({"generations": run_table})
 
-            if success:
-                num_correct += 1
+                conversation.messages.append({"role": "assistant", "content": completion})
 
+                if predicted_answer is not None:
+                    unique_predicted_answers.add(predicted_answer)
+
+                if correct:
+                    conversation.success = True
+                    continue
+
+                if attempt_idx < args.max_attempts - 1:
+                    conversation.messages.append({"role": "user", "content": args.retry_prompt})
+
+        num_correct = sum(1 for conv in conversations if conv.success)
         num_unique_predicted_answers = len(unique_predicted_answers)
         wandb.log({"num_unique_predicted_answers": num_unique_predicted_answers, "problem_idx": idx})
 
