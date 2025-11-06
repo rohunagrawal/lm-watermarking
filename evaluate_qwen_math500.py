@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate pass@k for a Qwen language model on AIME25."""
+"""Evaluate pass@k for a Qwen language model on MATH-500."""
 import argparse
 import json
 import math
@@ -19,7 +19,7 @@ import wandb
 
 @dataclass
 class SampleResult:
-    """Stores generation results for a single AIME25 problem."""
+    """Stores generation results for a single MATH-500 problem."""
 
     question: str
     reference_answer: str
@@ -32,8 +32,8 @@ ANSWER_PATTERN = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 MODEL_ANSWER_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 
-def parse_aime_answer(answer: Any) -> Optional[str]:
-    """Extract the canonical numeric answer string from an AIME reference solution."""
+def parse_math500_answer(answer: Any) -> Optional[str]:
+    """Extract the canonical numeric answer string from a MATH-500 reference solution."""
 
     if answer is None:
         return None
@@ -57,7 +57,7 @@ def parse_aime_answer(answer: Any) -> Optional[str]:
     if isinstance(answer, Dict):
         for key in ("answer", "ans", "label"):
             if key in answer:
-                return parse_aime_answer(answer[key])
+                return parse_math500_answer(answer[key])
 
     return None
 
@@ -315,15 +315,15 @@ def generate_completions_with_watermark(
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
     if not args.disable_watermark:
-        run_name = f"qwen-aime-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+        run_name = f"qwen-math500-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
     else:
-        run_name = f"qwen-aime-{args.model_name}-numquestions{args.limit}"
-    wandb.init(project="qwen-aime-eval", config=vars(args), name=run_name)
+        run_name = f"qwen-math500-{args.model_name}-numquestions{args.limit}"
+    wandb.init(project="qwen-math500-eval", config=vars(args), name=run_name)
     run_table = None
     if args.log_completions:
         run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
-    dataset = load_dataset("yentinglin/aime_2025", split=args.split)
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
 
@@ -353,7 +353,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     for idx, example in enumerate(dataset):
         question_text = extract_question(example)
         raw_answer = extract_answer(example)
-        reference_answer = parse_aime_answer(raw_answer)
+        reference_answer = parse_math500_answer(raw_answer)
         if args.disable_watermark:
             completions = generate_completions(
                 model=model,
@@ -498,7 +498,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=50,
-        help="Limit the number of AIME25 problems to evaluate (None evaluates full split).",
+        help="Limit the number of MATH-500 problems to evaluate (None evaluates full split).",
     )
     parser.add_argument(
         "--num-samples",
