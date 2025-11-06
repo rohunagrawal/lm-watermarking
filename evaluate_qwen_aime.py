@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -15,11 +15,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorLis
 
 from extended_watermark_processor import WatermarkLogitsProcessor
 import wandb
-
-try:
-    from mathverify import MathVerify
-except ImportError:  # pragma: no cover - optional runtime dependency
-    MathVerify = None
 
 
 @dataclass
@@ -32,103 +27,47 @@ class SampleResult:
     pass_at_k: Dict[int, float] = field(default_factory=dict)
 
 
+BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}")
 ANSWER_PATTERN = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 MODEL_ANSWER_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 
-class MathVerifyWrapper:
-    """Lightweight adapter that extracts MathVerify answers when available."""
+def parse_aime_answer(answer: Any) -> Optional[str]:
+    """Extract the canonical numeric answer string from an AIME reference solution."""
 
-    def __init__(self, device: torch.device):
-        if MathVerify is None:
-            raise ImportError(
-                "The mathverify package is required for AIME evaluation. Install it via `pip install mathverify`."
-            )
+    if answer is None:
+        return None
 
-        self._verifier = self._initialize_verifier(device)
+    if isinstance(answer, (int, float)):
+        return str(answer)
 
-    @staticmethod
-    def _initialize_verifier(device: torch.device) -> Any:
-        """Attempt to initialise MathVerify with a variety of constructor patterns."""
+    if isinstance(answer, str):
+        stripped = answer.strip()
+        match = ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        match = BOXED_ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        match = MODEL_ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        return stripped if stripped else None
 
-        candidate_initializers = []
+    if isinstance(answer, Dict):
+        for key in ("answer", "ans", "label"):
+            if key in answer:
+                return parse_aime_answer(answer[key])
 
-        # Prefer passing through an explicit device string when possible.
-        device_string = "cuda" if device.type == "cuda" else "cpu"
-        candidate_initializers.append(lambda: MathVerify(device=device_string))
-
-        # Some releases expose a simple no-argument constructor.
-        candidate_initializers.append(lambda: MathVerify())
-
-        # Fallback: attempt to call from_pretrained if available on the class.
-        if hasattr(MathVerify, "from_pretrained"):
-            candidate_initializers.append(lambda: MathVerify.from_pretrained("mathverify/mathverify"))
-
-        last_error: Optional[Exception] = None
-        for initializer in candidate_initializers:
-            try:
-                return initializer()
-            except Exception as exc:  # pragma: no cover - depends on external package implementation
-                last_error = exc
-
-        raise RuntimeError("Unable to initialise MathVerify") from last_error
-
-    def verify(
-        self,
-        question: str,
-        completion: str,
-        reference_answer: Optional[str],
-    ) -> Tuple[Optional[str], bool]:
-        """Run MathVerify on a completion and extract the predicted answer."""
-
-        predicted_answer: Optional[str] = None
-        is_correct: Optional[bool] = None
-
-        verification_result: Any = None
-        if hasattr(self._verifier, "verify"):
-            verification_result = self._verifier.verify(question=question, response=completion)
-        elif callable(self._verifier):  # pragma: no cover - defensive
-            verification_result = self._verifier(question=question, response=completion)
-
-        if isinstance(verification_result, dict):
-            predicted_answer = (
-                verification_result.get("prediction")
-                or verification_result.get("predicted_answer")
-                or verification_result.get("answer")
-            )
-            if "is_correct" in verification_result:
-                is_correct = bool(verification_result["is_correct"])
-            elif "correct" in verification_result:
-                is_correct = bool(verification_result["correct"])
-        elif verification_result is not None:
-            predicted_answer = (
-                getattr(verification_result, "prediction", None)
-                or getattr(verification_result, "predicted_answer", None)
-                or getattr(verification_result, "answer", None)
-            )
-            if hasattr(verification_result, "is_correct"):
-                is_correct = bool(getattr(verification_result, "is_correct"))
-            elif hasattr(verification_result, "correct"):
-                is_correct = bool(getattr(verification_result, "correct"))
-
-        if predicted_answer is None:
-            predicted_answer = parse_model_answer(completion)
-
-        if reference_answer is not None and predicted_answer is not None:
-            is_correct = is_answer_correct(predicted_answer, reference_answer)
-
-        return predicted_answer, bool(is_correct) if is_correct is not None else False
-
-
-def parse_aime_answer(answer: str) -> Optional[str]:
-    """Extract the canonical numeric answer string from an AIME25 reference solution."""
-
-    match = ANSWER_PATTERN.search(answer)
-    return match.group(1) if match else None
+    return None
 
 
 def parse_model_answer(completion: str) -> Optional[str]:
     """Attempt to extract the final numeric answer from a model completion."""
+
+    boxed_match = BOXED_ANSWER_PATTERN.search(completion)
+    if boxed_match:
+        return boxed_match.group(1)
 
     # Search the last 3 lines for a numeric answer to reduce spurious matches.
     lines = [line.strip() for line in completion.strip().splitlines() if line.strip()]
@@ -176,8 +115,26 @@ def build_prompt(question: str, system_prompt: str) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": question.strip()})
+    user_prompt = (
+        f"{question.strip()}\n\n"
+        "Provide only the final numeric answer enclosed in \\boxed{ }."
+    )
+    messages.append({"role": "user", "content": user_prompt})
     return messages
+
+
+def extract_question(example: Dict[str, Any]) -> str:
+    for key in ("problem", "question", "prompt", "input"):
+        if key in example and example[key]:
+            return str(example[key])
+    raise KeyError("Unable to locate question text in dataset example")
+
+
+def extract_answer(example: Dict[str, Any]) -> Any:
+    for key in ("answer", "ans", "label", "target"):
+        if key in example:
+            return example[key]
+    raise KeyError("Unable to locate answer in dataset example")
 
 
 def _repeat_batch(encoded: Dict[str, torch.Tensor], batch_size: int) -> Dict[str, torch.Tensor]:
@@ -366,7 +323,7 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     if args.log_completions:
         run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
-    dataset = load_dataset("lighteval/AIME25", split=args.split)
+    dataset = load_dataset("yentinglin/aime_2025", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
 
@@ -390,18 +347,18 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
 
     model.eval()
 
-    math_verifier = MathVerifyWrapper(device)
-
     aggregate_pass_at_k = {k: [] for k in args.pass_k}
     sample_results: List[SampleResult] = []
 
     for idx, example in enumerate(dataset):
-        reference_answer = parse_aime_answer(example["answer"])
+        question_text = extract_question(example)
+        raw_answer = extract_answer(example)
+        reference_answer = parse_aime_answer(raw_answer)
         if args.disable_watermark:
             completions = generate_completions(
                 model=model,
                 tokenizer=tokenizer,
-                question=example["question"],
+                question=question_text,
                 system_prompt=args.system_prompt,
                 num_samples=args.num_samples,
                 max_new_tokens=args.max_new_tokens,
@@ -410,13 +367,13 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 device=device,
                 seed=args.seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
-                answer=reference_answer,
+                answer=reference_answer or str(raw_answer),
             )
         else:
             completions = generate_completions_with_watermark(
                 model=model,
                 tokenizer=tokenizer,
-                question=example["question"],
+                question=question_text,
                 system_prompt=args.system_prompt,
                 num_samples=args.num_samples,
                 max_new_tokens=args.max_new_tokens,
@@ -429,11 +386,11 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 watermark_seeding_scheme=args.watermark_seeding_scheme,
                 watermark_seed=args.watermark_seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
-                answer=reference_answer
+                answer=reference_answer or str(raw_answer),
             )
 
         per_sample = SampleResult(
-            question=example["question"],
+            question=question_text,
             reference_answer=reference_answer or "",
         )
 
@@ -441,11 +398,8 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         num_correct = 0
         unique_predicted_answers = set()
         for completion in completions:
-            predicted_answer, correct = math_verifier.verify(
-                question=example["question"],
-                completion=completion,
-                reference_answer=reference_answer,
-            )
+            predicted_answer = parse_model_answer(completion)
+            correct = is_answer_correct(predicted_answer, reference_answer)
             if predicted_answer is not None:
                 unique_predicted_answers.add(predicted_answer)
             if correct:
@@ -462,8 +416,8 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
             if args.log_completions and run_table is not None:
                 run_table.add_data(
                     idx,
-                    example["question"],
-                    reference_answer,
+                    question_text,
+                    reference_answer if reference_answer is not None else (str(raw_answer) if raw_answer is not None else ""),
                     completion,
                     predicted_answer,
                     correct,

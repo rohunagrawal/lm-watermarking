@@ -6,4 +6,3 @@ torch
 transformers
 tokenizers
 wandb
-mathverify
