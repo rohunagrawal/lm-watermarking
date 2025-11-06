@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate pass@k for a Qwen language model on GSM8K."""
+"""Evaluate pass@k for a Qwen language model on AIME25."""
 import argparse
 import json
 import math
@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
@@ -16,10 +16,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorLis
 from extended_watermark_processor import WatermarkLogitsProcessor
 import wandb
 
+try:
+    from mathverify import MathVerify
+except ImportError:  # pragma: no cover - optional runtime dependency
+    MathVerify = None
+
 
 @dataclass
 class SampleResult:
-    """Stores generation results for a single GSM8K problem."""
+    """Stores generation results for a single AIME25 problem."""
 
     question: str
     reference_answer: str
@@ -31,8 +36,92 @@ ANSWER_PATTERN = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 MODEL_ANSWER_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 
-def parse_gsm8k_answer(answer: str) -> Optional[str]:
-    """Extract the canonical numeric answer string from a GSM8K reference solution."""
+class MathVerifyWrapper:
+    """Lightweight adapter that extracts MathVerify answers when available."""
+
+    def __init__(self, device: torch.device):
+        if MathVerify is None:
+            raise ImportError(
+                "The mathverify package is required for AIME evaluation. Install it via `pip install mathverify`."
+            )
+
+        self._verifier = self._initialize_verifier(device)
+
+    @staticmethod
+    def _initialize_verifier(device: torch.device) -> Any:
+        """Attempt to initialise MathVerify with a variety of constructor patterns."""
+
+        candidate_initializers = []
+
+        # Prefer passing through an explicit device string when possible.
+        device_string = "cuda" if device.type == "cuda" else "cpu"
+        candidate_initializers.append(lambda: MathVerify(device=device_string))
+
+        # Some releases expose a simple no-argument constructor.
+        candidate_initializers.append(lambda: MathVerify())
+
+        # Fallback: attempt to call from_pretrained if available on the class.
+        if hasattr(MathVerify, "from_pretrained"):
+            candidate_initializers.append(lambda: MathVerify.from_pretrained("mathverify/mathverify"))
+
+        last_error: Optional[Exception] = None
+        for initializer in candidate_initializers:
+            try:
+                return initializer()
+            except Exception as exc:  # pragma: no cover - depends on external package implementation
+                last_error = exc
+
+        raise RuntimeError("Unable to initialise MathVerify") from last_error
+
+    def verify(
+        self,
+        question: str,
+        completion: str,
+        reference_answer: Optional[str],
+    ) -> Tuple[Optional[str], bool]:
+        """Run MathVerify on a completion and extract the predicted answer."""
+
+        predicted_answer: Optional[str] = None
+        is_correct: Optional[bool] = None
+
+        verification_result: Any = None
+        if hasattr(self._verifier, "verify"):
+            verification_result = self._verifier.verify(question=question, response=completion)
+        elif callable(self._verifier):  # pragma: no cover - defensive
+            verification_result = self._verifier(question=question, response=completion)
+
+        if isinstance(verification_result, dict):
+            predicted_answer = (
+                verification_result.get("prediction")
+                or verification_result.get("predicted_answer")
+                or verification_result.get("answer")
+            )
+            if "is_correct" in verification_result:
+                is_correct = bool(verification_result["is_correct"])
+            elif "correct" in verification_result:
+                is_correct = bool(verification_result["correct"])
+        elif verification_result is not None:
+            predicted_answer = (
+                getattr(verification_result, "prediction", None)
+                or getattr(verification_result, "predicted_answer", None)
+                or getattr(verification_result, "answer", None)
+            )
+            if hasattr(verification_result, "is_correct"):
+                is_correct = bool(getattr(verification_result, "is_correct"))
+            elif hasattr(verification_result, "correct"):
+                is_correct = bool(getattr(verification_result, "correct"))
+
+        if predicted_answer is None:
+            predicted_answer = parse_model_answer(completion)
+
+        if reference_answer is not None and predicted_answer is not None:
+            is_correct = is_answer_correct(predicted_answer, reference_answer)
+
+        return predicted_answer, bool(is_correct) if is_correct is not None else False
+
+
+def parse_aime_answer(answer: str) -> Optional[str]:
+    """Extract the canonical numeric answer string from an AIME25 reference solution."""
 
     match = ANSWER_PATTERN.search(answer)
     return match.group(1) if match else None
@@ -83,17 +172,11 @@ def compute_pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
     return 1.0 - (numerator / denominator)
 
 
-def build_prompt(question: str, system_prompt: str) -> str:
-    user_content = (
-        "Solve the following grade school math word problem step-by-step. "
-        "Respond with your reasoning and finish your reply with a line starting with 'Answer:' "
-        "followed by the final numeric result.\n\n"
-        f"Problem: {question.strip()}"
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
+def build_prompt(question: str, system_prompt: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question.strip()})
     return messages
 
 
@@ -275,15 +358,15 @@ def generate_completions_with_watermark(
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
     if not args.disable_watermark:
-        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+        run_name = f"qwen-aime-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
     else:
-        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}"
-    wandb.init(project="qwen-gsm8k-eval", config=vars(args), name=run_name)
+        run_name = f"qwen-aime-{args.model_name}-numquestions{args.limit}"
+    wandb.init(project="qwen-aime-eval", config=vars(args), name=run_name)
     run_table = None
     if args.log_completions:
         run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
-    dataset = load_dataset("gsm8k", "main", split=args.split)
+    dataset = load_dataset("lighteval/AIME25", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
 
@@ -307,11 +390,13 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
 
     model.eval()
 
+    math_verifier = MathVerifyWrapper(device)
+
     aggregate_pass_at_k = {k: [] for k in args.pass_k}
     sample_results: List[SampleResult] = []
 
     for idx, example in enumerate(dataset):
-        reference_answer = parse_gsm8k_answer(example["answer"])
+        reference_answer = parse_aime_answer(example["answer"])
         if args.disable_watermark:
             completions = generate_completions(
                 model=model,
@@ -356,10 +441,13 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         num_correct = 0
         unique_predicted_answers = set()
         for completion in completions:
-            predicted_answer = parse_model_answer(completion)
+            predicted_answer, correct = math_verifier.verify(
+                question=example["question"],
+                completion=completion,
+                reference_answer=reference_answer,
+            )
             if predicted_answer is not None:
                 unique_predicted_answers.add(predicted_answer)
-            correct = is_answer_correct(predicted_answer, reference_answer)
             if correct:
                 num_correct += 1
             per_sample.generations.append(
@@ -456,7 +544,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=50,
-        help="Limit the number of GSM8K problems to evaluate (None evaluates full split).",
+        help="Limit the number of AIME25 problems to evaluate (None evaluates full split).",
     )
     parser.add_argument(
         "--num-samples",
@@ -503,8 +591,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--system-prompt",
-        default="You are a careful math tutor who explains their reasoning clearly and concisely.",
-        help="System prompt used for chat-based Qwen models.",
+        default="",
+        help="Optional system prompt for chat-based Qwen models (defaults to empty string).",
     )
     parser.add_argument(
         "--output-path",
