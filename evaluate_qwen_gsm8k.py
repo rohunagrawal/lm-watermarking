@@ -275,11 +275,13 @@ def generate_completions_with_watermark(
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
     if not args.disable_watermark:
-        run_name = f"qwen-gsm8k-{args.model_name}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
     else:
-        run_name = f"qwen-gsm8k-{args.model_name}"
+        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}"
     wandb.init(project="qwen-gsm8k-eval", config=vars(args), name=run_name)
-    run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
+    run_table = None
+    if args.log_completions:
+        run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
     dataset = load_dataset("gsm8k", "main", split=args.split)
     if args.limit is not None:
@@ -368,16 +370,17 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 }
             )
             # WANDB: log generation to table
-            run_table.add_data(
-                idx,
-                example["question"],
-                reference_answer,
-                completion,
-                predicted_answer,
-                correct,
-                not args.disable_watermark
-            )
-            wandb.log({"generations": run_table})
+            if args.log_completions and run_table is not None:
+                run_table.add_data(
+                    idx,
+                    example["question"],
+                    reference_answer,
+                    completion,
+                    predicted_answer,
+                    correct,
+                    not args.disable_watermark
+                )
+                wandb.log({"generations": run_table})
         num_unique_predicted_answers = len(unique_predicted_answers)
         wandb.log({"num_unique_predicted_answers": num_unique_predicted_answers, "problem_idx": idx})
 
@@ -429,7 +432,8 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         for k, scores in aggregate_pass_at_k.items()
     }
     wandb.log({**averaged_scores, "final_step": True})
-    wandb.log({"generations": run_table})
+    if args.log_completions and run_table is not None:
+        wandb.log({"generations": run_table})
     wandb.finish()
 
     return averaged_scores
@@ -450,20 +454,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=10,
+        default=50,
         help="Limit the number of GSM8K problems to evaluate (None evaluates full split).",
     )
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=4,
+        default=8,
         help="Number of stochastic completions to generate per problem.",
     )
     parser.add_argument(
         "--pass-k",
         type=int,
         nargs="+",
-        default=[1, 2, 4],
+        default=[1, 4, 8],
         help="Values of k for pass@k computation.",
     )
     parser.add_argument(
@@ -529,13 +533,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--watermark-gamma",
         type=float,
-        default=0.25,
+        default=0.1,
         help="Fraction of the vocabulary used for the watermark greenlist.",
     )
     parser.add_argument(
         "--watermark-delta",
         type=float,
-        default=0.5,
+        default=2.0,
         help="Logit bias added to watermark greenlist tokens.",
     )
     parser.add_argument(
@@ -548,6 +552,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Base seed for the watermark RNG.",
+    )
+    parser.add_argument(
+        "--log-completions",
+        action="store_true",
+        help="If set, log all completions to a wandb table. Does not affect metric summary logging.",
     )
     return parser.parse_args()
 
