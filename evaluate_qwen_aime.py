@@ -486,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-name",
-        default="Qwen/Qwen2.5-3B-Instruct",
+        default="Qwen/Qwen3-4B-Instruct-2507",
         help="Name of the Hugging Face model to evaluate.",
     )
     parser.add_argument(
@@ -497,7 +497,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=50,
+        default=None,
         help="Limit the number of AIME25 problems to evaluate (None evaluates full split).",
     )
     parser.add_argument(
