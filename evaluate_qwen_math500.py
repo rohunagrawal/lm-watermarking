@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate pass@k for a Qwen language model on GSM8K."""
+"""Evaluate pass@k for a Qwen language model on MATH-500."""
 import argparse
 import json
 import math
@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -19,7 +19,7 @@ import wandb
 
 @dataclass
 class SampleResult:
-    """Stores generation results for a single GSM8K problem."""
+    """Stores generation results for a single MATH-500 problem."""
 
     question: str
     reference_answer: str
@@ -27,19 +27,47 @@ class SampleResult:
     pass_at_k: Dict[int, float] = field(default_factory=dict)
 
 
+BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\{\s*(-?\d+(?:\.\d+)?)\s*\}")
 ANSWER_PATTERN = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 MODEL_ANSWER_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 
-def parse_gsm8k_answer(answer: str) -> Optional[str]:
-    """Extract the canonical numeric answer string from a GSM8K reference solution."""
+def parse_math500_answer(answer: Any) -> Optional[str]:
+    """Extract the canonical numeric answer string from a MATH-500 reference solution."""
 
-    match = ANSWER_PATTERN.search(answer)
-    return match.group(1) if match else None
+    if answer is None:
+        return None
+
+    if isinstance(answer, (int, float)):
+        return str(answer)
+
+    if isinstance(answer, str):
+        stripped = answer.strip()
+        match = ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        match = BOXED_ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        match = MODEL_ANSWER_PATTERN.search(stripped)
+        if match:
+            return match.group(1)
+        return stripped if stripped else None
+
+    if isinstance(answer, Dict):
+        for key in ("answer", "ans", "label"):
+            if key in answer:
+                return parse_math500_answer(answer[key])
+
+    return None
 
 
 def parse_model_answer(completion: str) -> Optional[str]:
     """Attempt to extract the final numeric answer from a model completion."""
+
+    boxed_match = BOXED_ANSWER_PATTERN.search(completion)
+    if boxed_match:
+        return boxed_match.group(1)
 
     # Search the last 3 lines for a numeric answer to reduce spurious matches.
     lines = [line.strip() for line in completion.strip().splitlines() if line.strip()]
@@ -83,18 +111,30 @@ def compute_pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
     return 1.0 - (numerator / denominator)
 
 
-def build_prompt(question: str, system_prompt: str) -> str:
-    user_content = (
-        "Solve the following grade school math word problem step-by-step. "
-        "Respond with your reasoning and finish your reply with a line starting with 'Answer:' "
-        "followed by the final numeric result.\n\n"
-        f"Problem: {question.strip()}"
+def build_prompt(question: str, system_prompt: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    user_prompt = (
+        f"{question.strip()}\n\n"
+        "Provide only the final numeric answer enclosed in \\boxed{ }."
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
+    messages.append({"role": "user", "content": user_prompt})
     return messages
+
+
+def extract_question(example: Dict[str, Any]) -> str:
+    for key in ("problem", "question", "prompt", "input"):
+        if key in example and example[key]:
+            return str(example[key])
+    raise KeyError("Unable to locate question text in dataset example")
+
+
+def extract_answer(example: Dict[str, Any]) -> Any:
+    for key in ("answer", "ans", "label", "target"):
+        if key in example:
+            return example[key]
+    raise KeyError("Unable to locate answer in dataset example")
 
 
 def _repeat_batch(encoded: Dict[str, torch.Tensor], batch_size: int) -> Dict[str, torch.Tensor]:
@@ -275,15 +315,15 @@ def generate_completions_with_watermark(
 def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     # WANDB SETUP
     if not args.disable_watermark:
-        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
+        run_name = f"qwen-math500-{args.model_name}-numquestions{args.limit}-gamma{args.watermark_gamma}-delta{args.watermark_delta}"
     else:
-        run_name = f"qwen-gsm8k-{args.model_name}-numquestions{args.limit}"
-    wandb.init(project="qwen-gsm8k-eval", config=vars(args), name=run_name)
+        run_name = f"qwen-math500-{args.model_name}-numquestions{args.limit}"
+    wandb.init(project="qwen-math500-eval", config=vars(args), name=run_name)
     run_table = None
     if args.log_completions:
         run_table = wandb.Table(columns=["idx", "question", "reference_answer", "completion", "predicted_answer", "is_correct", "watermark_applied"], log_mode="MUTABLE")
 
-    dataset = load_dataset("gsm8k", "main", split=args.split)
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split=args.split)
     if args.limit is not None:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
 
@@ -311,12 +351,14 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
     sample_results: List[SampleResult] = []
 
     for idx, example in enumerate(dataset):
-        reference_answer = parse_gsm8k_answer(example["answer"])
+        question_text = extract_question(example)
+        raw_answer = extract_answer(example)
+        reference_answer = parse_math500_answer(raw_answer)
         if args.disable_watermark:
             completions = generate_completions(
                 model=model,
                 tokenizer=tokenizer,
-                question=example["question"],
+                question=question_text,
                 system_prompt=args.system_prompt,
                 num_samples=args.num_samples,
                 max_new_tokens=args.max_new_tokens,
@@ -325,13 +367,13 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 device=device,
                 seed=args.seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
-                answer=reference_answer,
+                answer=reference_answer or str(raw_answer),
             )
         else:
             completions = generate_completions_with_watermark(
                 model=model,
                 tokenizer=tokenizer,
-                question=example["question"],
+                question=question_text,
                 system_prompt=args.system_prompt,
                 num_samples=args.num_samples,
                 max_new_tokens=args.max_new_tokens,
@@ -344,11 +386,11 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
                 watermark_seeding_scheme=args.watermark_seeding_scheme,
                 watermark_seed=args.watermark_seed + idx * args.num_samples,
                 batch_size=args.generation_batch_size,
-                answer=reference_answer
+                answer=reference_answer or str(raw_answer),
             )
 
         per_sample = SampleResult(
-            question=example["question"],
+            question=question_text,
             reference_answer=reference_answer or "",
         )
 
@@ -357,9 +399,9 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
         unique_predicted_answers = set()
         for completion in completions:
             predicted_answer = parse_model_answer(completion)
+            correct = is_answer_correct(predicted_answer, reference_answer)
             if predicted_answer is not None:
                 unique_predicted_answers.add(predicted_answer)
-            correct = is_answer_correct(predicted_answer, reference_answer)
             if correct:
                 num_correct += 1
             per_sample.generations.append(
@@ -374,8 +416,8 @@ def evaluate_model(args: argparse.Namespace) -> Dict[str, float]:
             if args.log_completions and run_table is not None:
                 run_table.add_data(
                     idx,
-                    example["question"],
-                    reference_answer,
+                    question_text,
+                    reference_answer if reference_answer is not None else (str(raw_answer) if raw_answer is not None else ""),
                     completion,
                     predicted_answer,
                     correct,
@@ -456,7 +498,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=50,
-        help="Limit the number of GSM8K problems to evaluate (None evaluates full split).",
+        help="Limit the number of MATH-500 problems to evaluate (None evaluates full split).",
     )
     parser.add_argument(
         "--num-samples",
@@ -503,8 +545,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--system-prompt",
-        default="You are a careful math tutor who explains their reasoning clearly and concisely.",
-        help="System prompt used for chat-based Qwen models.",
+        default="",
+        help="Optional system prompt for chat-based Qwen models (defaults to empty string).",
     )
     parser.add_argument(
         "--output-path",
